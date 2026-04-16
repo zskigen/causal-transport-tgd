@@ -1,0 +1,579 @@
+---
+title: "Comp Fusion"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(MASS)
+```
+
+## Computational Setup
+
+Let $S = 1$ denote the source ketamine cohort and $S = 0$ the target TGD population. Here $\Delta = Y_{12m} - Y_{\text{baseline}}$ denotes the change in outcome between baseline and 12 months under ketamine treatment.
+
+**Goal:** Monte Carlo implementation of the transport functional
+
+$$
+\psi = E_{Z \sim P^*(Z)}\big[E(\Delta \mid Z, S = 0)\big]
+$$
+
+In the Monte Carlo implementation below, this functional is estimated by
+
+$$
+\hat{\psi}
+=
+\frac{1}{T}
+\sum_{t=1}^{T}
+\left(
+\frac{1}{M}
+\sum_{i=1}^{M}
+\big(\alpha^{(t)} + B^{(t)\top} Z_i^{(t)}\big)
+\right)
+$$
+
+where $\theta^{(t)} = (\alpha^{(t)}, B^{(t)}, \sigma)$ denotes the $t$-th draw of the response surface parameters and $Z_i^{(t)} \sim P^*(Z)$ are simulated target covariates.
+
+This quantity represents the expected change in outcome under ketamine treatment in the target population.
+
+Consequently, the estimand should be interpreted as the transported expected treatment response rather than a causal average treatment effect.
+
+The Monte Carlo procedure below constructs an estimator of $\psi$ by approximating the outer expectation over $P^*(Z)$ using simulated draws from the target covariate distribution. Because the response surface parameters and the joint covariate distribution are not observed jointly in any dataset, this integral is evaluated using Monte Carlo simulation.
+
+Thus the computational procedure approximates the transported treatment effect $\psi$ by repeatedly drawing plausible response surfaces consistent with the source study and integrating those response surfaces over the target covariate distribution.
+
+There are two layers of uncertainty:
+
+-   **Parameter uncertainty** over $(\alpha, B, \sigma)$: across $T$ draws we ask "what response surfaces are consistent with the published source summaries?"
+-   **Covariate heterogeneity** over $M$ individuals: for each draw we simulate a large target population $Z_i \sim P^*(Z)$ and average over it
+
+The distribution of $\psi^{(t)}$ reflects uncertainty in the response surface consistent with the published source summaries and the prior on slope magnitudes. Because the priors are partially constrained using published moment summaries rather than updated through a full likelihood, the resulting distribution should be interpreted as a constrained prior predictive distribution rather than a fully Bayesian posterior.
+
+The transport step assumes structural invariance of the response surface across populations: conditional on baseline covariates $Z$, the expected treatment response is assumed to be the same in the source ketamine cohort and the target TGD population. Formally,
+
+$$E[\Delta \mid Z, S = 1] = E[\Delta \mid Z, S = 0]$$
+
+This is the core identification assumption of the framework.
+
+Under this assumption,
+
+$$
+E(\Delta \mid Z, S = 0) = E(\Delta \mid Z, S = 1),
+$$
+
+so the target estimand can be written in terms of the source response surface:
+
+$$
+\psi = E_{Z\sim P^*(Z)}[E(\Delta \mid Z, S = 1)].
+$$
+
+------------------------------------------------------------------------
+
+## `anchor_alpha()`
+
+```{r}
+anchor_alpha <- function(mu_delta_source,
+                          B_row,
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0)) {
+  as.numeric(mu_delta_source - sum(B_row * z0_std_mean))
+}
+```
+
+## 3) Helper: `draw_B()`
+
+```{r}
+draw_B <- function(beta_sd,
+                   enforce_diagonal_signs = TRUE,
+                   cross_signs = NULL) {
+  B <- matrix(rnorm(4, mean = 0, sd = beta_sd), nrow = 2, ncol = 2,
+              byrow = TRUE)
+  rownames(B) <- c("pain", "dep")
+  colnames(B) <- c("pain0_std", "dep0_std")
+
+  if (enforce_diagonal_signs) {
+    B["pain", "pain0_std"] <- -abs(B["pain", "pain0_std"])
+    B["dep",  "dep0_std"]  <- -abs(B["dep",  "dep0_std"])
+  }
+
+  if (!is.null(cross_signs)) {
+    if (!is.null(cross_signs$pain_on_dep0)) {
+      if (cross_signs$pain_on_dep0 == -1)
+        B["pain", "dep0_std"] <- -abs(B["pain", "dep0_std"])
+      if (cross_signs$pain_on_dep0 == +1)
+        B["pain", "dep0_std"] <-  abs(B["pain", "dep0_std"])
+    }
+    if (!is.null(cross_signs$dep_on_pain0)) {
+      if (cross_signs$dep_on_pain0 == -1)
+        B["dep", "pain0_std"] <- -abs(B["dep", "pain0_std"])
+      if (cross_signs$dep_on_pain0 == +1)
+        B["dep", "pain0_std"] <-  abs(B["dep", "pain0_std"])
+    }
+  }
+  B
+}
+```
+
+## `simulate_target_Z_std()`
+
+```{r}
+simulate_target_Z_std <- function(M,
+                                  mu_z_target_raw,
+                                  sd_z_target_raw,
+                                  rho_z_target,
+                                  mu_z_source_raw,
+                                  sd_z_source_raw) {
+  Sigma_z_target_raw <- matrix(
+    c(sd_z_target_raw["pain0"]^2,
+      rho_z_target * sd_z_target_raw["pain0"] * sd_z_target_raw["dep0"],
+      rho_z_target * sd_z_target_raw["pain0"] * sd_z_target_raw["dep0"],
+      sd_z_target_raw["dep0"]^2),
+    nrow = 2, byrow = TRUE
+  )
+  Z_raw <- mvrnorm(n = M, mu = mu_z_target_raw, Sigma = Sigma_z_target_raw)
+  colnames(Z_raw) <- c("pain0", "dep0")
+
+  Z_std <- sweep(Z_raw, 2, mu_z_source_raw, "-")
+  Z_std <- sweep(Z_std, 2, sd_z_source_raw, "/")
+  colnames(Z_std) <- c("pain0_std", "dep0_std")
+
+  list(Z_raw = Z_raw, Z_std = Z_std,
+       Sigma_z_target_raw = Sigma_z_target_raw)
+}
+```
+
+$$
+\psi = E_{Z \sim P^*(Z)}[E(\Delta \mid Z, S = 0)],
+$$
+
+which is evaluated using the source response surface under the structural invariance assumption
+
+$$
+E(\Delta \mid Z, S = 0) = E(\Delta \mid Z, S = 1).
+$$
+
+
+## `simulate_delta()`
+
+```{r}
+simulate_delta <- function(Z_std, alpha, B, sigma) {
+  stopifnot(ncol(Z_std) == ncol(B))
+  
+  mu_pain <- as.numeric(alpha["pain"] + Z_std %*% B["pain", ])
+  mu_dep  <- as.numeric(alpha["dep"]  + Z_std %*% B["dep",  ])
+
+  D_pain <- rnorm(nrow(Z_std), mean = mu_pain, sd = sigma["pain"])
+  D_dep  <- rnorm(nrow(Z_std), mean = mu_dep,  sd = sigma["dep"])
+
+  list(mu_pain = mu_pain, mu_dep = mu_dep, D_pain = D_pain, D_dep = D_dep)
+}
+```
+
+## Inputs
+
+```{r}
+set.seed(1)
+T <- 4000   # draws over response surface shape
+M <- 10000  # target individuals per draw (Monte Carlo integration)
+
+# Published / assumed summary inputs
+mu_delta_source <- c(pain = -1.2, dep = -1.75)  # mean change in SOURCE at source mean baseline
+sigma_prior     <- c(pain = 1.2,  dep = 1.6)     # fixed residual SDs
+
+# Source baseline mean/sd (used to standardize Z)
+mu_z_source_raw <- c(pain0 = 4.8, dep0 = 6.9)
+sd_z_source_raw <- c(pain0 = 2.2, dep0 = 2.6)
+
+# Target baseline distribution (RAW scale)
+mu_z_target_raw <- c(pain0 = 6.2, dep0 = 9.1)
+sd_z_target_raw <- c(pain0 = 2.5, dep0 = 2.8)
+
+# Prior knobs
+beta_sd <- 0.15
+enforce_diagonal_signs <- TRUE
+cross_signs <- NULL
+```
+
+## Main Transport Loop
+
+Let $\psi^{(t)}$ denote the transported mean outcome change produced by the $t$-th draw of the response surface parameters.
+
+```{r}
+rho_z_target <- 0.0
+
+psi_pain <- numeric(T)
+psi_dep  <- numeric(T)
+mc_se_pain <- numeric(T)
+mc_se_dep  <- numeric(T)
+
+for (t in 1:T) {
+  B <- draw_B(
+    beta_sd = beta_sd,
+    enforce_diagonal_signs = enforce_diagonal_signs,
+    cross_signs = cross_signs
+  )
+
+  sigma <- sigma_prior
+  names(sigma) <- c("pain", "dep")
+
+  alpha <- c(
+    pain = anchor_alpha(mu_delta_source["pain"], B["pain", ],
+                        z0_std_mean = c(pain0_std = 0, dep0_std = 0)),
+    dep  = anchor_alpha(mu_delta_source["dep"],  B["dep",  ],
+                        z0_std_mean = c(pain0_std = 0, dep0_std = 0))
+  )
+
+  Z <- simulate_target_Z_std(
+    M = M,
+    mu_z_target_raw = mu_z_target_raw,
+    sd_z_target_raw = sd_z_target_raw,
+    rho_z_target = rho_z_target,
+    mu_z_source_raw = mu_z_source_raw,
+    sd_z_source_raw = sd_z_source_raw
+  )
+
+  sim <- simulate_delta(Z_std = Z$Z_std, alpha = alpha, B = B, sigma = sigma)
+
+  psi_pain[t] <- mean(sim$mu_pain)
+  psi_dep[t]  <- mean(sim$mu_dep)
+
+  mc_se_pain[t] <- sd(sim$D_pain) / sqrt(M)
+  mc_se_dep[t]  <- sd(sim$D_dep)  / sqrt(M)
+}
+```
+
+Each iteration $t$ draws a response surface $B$, anchors $\alpha$ to the published source summaries, simulates $M = 10{,}000$ target individuals from $P^*(Z)$, evaluates the conditional mean response $E(\Delta \mid Z, S = 1)$ for each simulated individual and records the mean across individuals as $\psi^{(t)}$. After $T$ iterations the collection $\{\psi^{(t)}\}$ characterizes the constrained prior predictive distribution of the transported effect
+
+$$
+\psi = E_{Z \sim P^*(Z)}[E(\Delta \mid Z, S = 0)],
+$$
+
+which is evaluated using the source response surface via the structural invariance assumption
+
+$$
+E(\Delta \mid Z, S = 0) = E(\Delta \mid Z, S = 1).
+$$
+
+**The two averages:** The inner average over $M$ individuals approximates
+
+$$
+E_{Z\sim P^*(Z)}[E(\Delta \mid Z, S = 1)]
+$$
+
+for a fixed response surface. The outer average over $T$ draws then marginalizes over uncertainty in the response surface parameters.
+
+The reported mean and intervals are computed from the outer distribution. These two layers of averaging correspond directly to the two sources of uncertainty identified in the setup: covariate heterogeneity and parameter uncertainty.
+
+**Monte Carlo standard error:** `mc_se_pain[t]` tracks the precision of the inner average for each draw. At $M = 10{,}000$ this is small relative to the between-draw variation in $\psi^{(t)}$, confirming that the width of the final intervals reflects genuine uncertainty in the response surface rather than Monte Carlo noise.
+
+## Output Summaries
+
+```{r}
+out_single <- list(
+  transported_pain = c(
+    mean = mean(psi_pain),
+    q025 = quantile(psi_pain, 0.025),
+    q50  = quantile(psi_pain, 0.5),
+    q975 = quantile(psi_pain, 0.975)
+  ),
+  transported_dep = c(
+    mean = mean(psi_dep),
+    q025 = quantile(psi_dep, 0.025),
+    q50  = quantile(psi_dep, 0.5),
+    q975 = quantile(psi_dep, 0.975)
+  ),
+  mc_se = c(
+    pain_mean = mean(mc_se_pain),
+    dep_mean  = mean(mc_se_dep)
+  ),
+  settings = list(
+    beta_sd = beta_sd,
+    enforce_diagonal_signs = enforce_diagonal_signs,
+    rho_z_target = rho_z_target,
+    cross_signs = cross_signs
+  )
+)
+
+out_single
+```
+
+**What the output represents:** The mean and quantiles of $\psi^{(t)}$ across $T$ draws summarize the constrained prior predictive distribution of the transported treatment effect
+
+$$
+\psi = E_{Z \sim P^*(Z)}[E(\Delta \mid Z, S = 0)],
+$$
+
+evaluated using the source response surface under the structural invariance assumption.
+
+Specifically, this corresponds to the expected change $\Delta = Y_{12m} - Y_{\text{baseline}}$ in pain and depression under ketamine treatment, transported to the TGD population.
+
+Because the priors are partially constrained using published moment summaries rather than updated through a full likelihood, these intervals should be interpreted as a constrained prior predictive distribution rather than a fully Bayesian posterior.
+
+## Rho Sensitivity Sweep
+
+```{r}
+rho_grid <- c(-0.3, 0.0, 0.3, 0.6)
+
+rho_results <- data.frame(
+  rho = rho_grid,
+  pain_mean = NA_real_, pain_q025 = NA_real_, pain_q50 = NA_real_,
+  pain_q975 = NA_real_,
+  dep_mean  = NA_real_, dep_q025  = NA_real_, dep_q50  = NA_real_,
+  dep_q975  = NA_real_,
+  mcse_pain = NA_real_, mcse_dep  = NA_real_
+)
+
+for (g in seq_along(rho_grid)) {
+  rho_z_target <- rho_grid[g]
+  psi_pain <- numeric(T)
+  psi_dep  <- numeric(T)
+  mc_se_pain <- numeric(T)
+  mc_se_dep  <- numeric(T)
+
+  for (t in 1:T) {
+    B <- draw_B(beta_sd, enforce_diagonal_signs, cross_signs)
+    sigma <- sigma_prior
+    names(sigma) <- c("pain", "dep")
+    alpha <- c(
+      pain = anchor_alpha(mu_delta_source["pain"], B["pain", ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0)),
+      dep  = anchor_alpha(mu_delta_source["dep"],  B["dep",  ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0))
+    )
+    Z <- simulate_target_Z_std(
+      M = M,
+      mu_z_target_raw = mu_z_target_raw,
+      sd_z_target_raw = sd_z_target_raw,
+      rho_z_target = rho_z_target,
+      mu_z_source_raw = mu_z_source_raw,
+      sd_z_source_raw = sd_z_source_raw
+    )
+    sim <- simulate_delta(Z_std = Z$Z_std, alpha = alpha, B = B, sigma = sigma)
+    psi_pain[t] <- mean(sim$mu_pain)
+    psi_dep[t]  <- mean(sim$mu_dep)
+    mc_se_pain[t] <- sd(sim$D_pain) / sqrt(M)
+    mc_se_dep[t]  <- sd(sim$D_dep)  / sqrt(M)
+  }
+
+  rho_results$pain_mean[g] <- mean(psi_pain)
+  rho_results$pain_q025[g] <- as.numeric(quantile(psi_pain, 0.025))
+  rho_results$pain_q50[g]  <- as.numeric(quantile(psi_pain, 0.5))
+  rho_results$pain_q975[g] <- as.numeric(quantile(psi_pain, 0.975))
+  rho_results$dep_mean[g]  <- mean(psi_dep)
+  rho_results$dep_q025[g]  <- as.numeric(quantile(psi_dep, 0.025))
+  rho_results$dep_q50[g]   <- as.numeric(quantile(psi_dep, 0.5))
+  rho_results$dep_q975[g]  <- as.numeric(quantile(psi_dep, 0.975))
+  rho_results$mcse_pain[g] <- mean(mc_se_pain)
+  rho_results$mcse_dep[g]  <- mean(mc_se_dep)
+}
+
+knitr::kable(
+  rho_results,
+  digits = 3,
+  caption = "Sensitivity of transported outcomes to the (unidentified)
+             target baseline correlation rho."
+)
+```
+
+## Beta_sd Sensitivity Sweep
+
+```{r}
+
+T <- 4000   # restate in case chunk is run in isolation
+M <- 10000
+
+beta_sd_grid <- c(0.05, 0.10, 0.15, 0.25)
+rho_z_target_fixed <- 0.0   # hold rho at baseline for this sweep
+
+beta_sd_results <- data.frame(
+  beta_sd    = beta_sd_grid,
+  pain_mean  = NA_real_, pain_q025 = NA_real_, pain_q50 = NA_real_,
+  pain_q975  = NA_real_,
+  dep_mean   = NA_real_, dep_q025  = NA_real_, dep_q50  = NA_real_,
+  dep_q975   = NA_real_,
+  mcse_pain  = NA_real_, mcse_dep  = NA_real_
+)
+
+for (g in seq_along(beta_sd_grid)) {
+  beta_sd_g <- beta_sd_grid[g]
+
+  psi_pain   <- numeric(T)
+  psi_dep    <- numeric(T)
+  mc_se_pain <- numeric(T)
+  mc_se_dep  <- numeric(T)
+
+  for (t in 1:T) {
+    B <- draw_B(beta_sd_g, enforce_diagonal_signs, cross_signs)
+    sigma <- sigma_prior
+    names(sigma) <- c("pain", "dep")
+
+    alpha <- c(
+      pain = anchor_alpha(mu_delta_source["pain"], B["pain", ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0)),
+      dep  = anchor_alpha(mu_delta_source["dep"],  B["dep",  ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0))
+    )
+
+    Z <- simulate_target_Z_std(
+      M               = M,
+      mu_z_target_raw = mu_z_target_raw,
+      sd_z_target_raw = sd_z_target_raw,
+      rho_z_target    = rho_z_target_fixed,
+      mu_z_source_raw = mu_z_source_raw,
+      sd_z_source_raw = sd_z_source_raw
+    )
+
+    sim <- simulate_delta(Z_std = Z$Z_std, alpha = alpha, B = B, sigma = sigma)
+
+    psi_pain[t]   <- mean(sim$mu_pain)
+    psi_dep[t]    <- mean(sim$mu_dep)
+    mc_se_pain[t] <- sd(sim$D_pain) / sqrt(M)
+    mc_se_dep[t]  <- sd(sim$D_dep)  / sqrt(M)
+  }
+
+  beta_sd_results$pain_mean[g] <- mean(psi_pain)
+  beta_sd_results$pain_q025[g] <- as.numeric(quantile(psi_pain, 0.025))
+  beta_sd_results$pain_q50[g]  <- as.numeric(quantile(psi_pain, 0.5))
+  beta_sd_results$pain_q975[g] <- as.numeric(quantile(psi_pain, 0.975))
+  beta_sd_results$dep_mean[g]  <- mean(psi_dep)
+  beta_sd_results$dep_q025[g]  <- as.numeric(quantile(psi_dep, 0.025))
+  beta_sd_results$dep_q50[g]   <- as.numeric(quantile(psi_dep, 0.5))
+  beta_sd_results$dep_q975[g]  <- as.numeric(quantile(psi_dep, 0.975))
+  beta_sd_results$mcse_pain[g] <- mean(mc_se_pain)
+  beta_sd_results$mcse_dep[g]  <- mean(mc_se_dep)
+}
+
+knitr::kable(
+  beta_sd_results,
+  digits  = 3,
+  caption = "Sensitivity of transported outcomes to the prior scale
+             beta_sd on slope magnitudes, with rho held fixed at 0.
+             At beta_sd = 0 the response surface is flat and psi
+             collapses to mu_delta_source; increasing beta_sd widens
+             the interval and shifts the mean as the covariate shift
+             has more leverage.")
+```
+
+
+## Mu sweep at rho* = 0.6 (to verify decoupling holds at nonzero correlation)
+
+```{r}
+rho_z_target_nonzero <- 0.6
+
+mu_pain_grid <- c(5.8, 6.2, 6.6)
+mu_dep_grid  <- c(8.5, 9.1, 9.7)
+mu_grid      <- expand.grid(mu_pain = mu_pain_grid, 
+                             mu_dep  = mu_dep_grid)
+
+mu_results_rho06 <- data.frame(
+  mu_pain   = mu_grid$mu_pain,
+  mu_dep    = mu_grid$mu_dep,
+  pain_mean = NA_real_, pain_q025 = NA_real_, pain_q975 = NA_real_,
+  dep_mean  = NA_real_, dep_q025  = NA_real_, dep_q975  = NA_real_
+)
+
+for (g in 1:nrow(mu_grid)) {
+  mu_z_target_raw_g <- c(pain0 = mu_grid$mu_pain[g], 
+                          dep0  = mu_grid$mu_dep[g])
+
+  psi_pain <- numeric(T)
+  psi_dep  <- numeric(T)
+
+  for (t in 1:T) {
+    B <- draw_B(beta_sd, enforce_diagonal_signs, cross_signs)
+    sigma <- sigma_prior
+    names(sigma) <- c("pain", "dep")
+
+    alpha <- c(
+      pain = anchor_alpha(mu_delta_source["pain"], B["pain", ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0)),
+      dep  = anchor_alpha(mu_delta_source["dep"],  B["dep",  ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0))
+    )
+
+    Z <- simulate_target_Z_std(
+      M               = M,
+      mu_z_target_raw = mu_z_target_raw_g,
+      sd_z_target_raw = sd_z_target_raw,
+      rho_z_target    = rho_z_target_nonzero,
+      mu_z_source_raw = mu_z_source_raw,
+      sd_z_source_raw = sd_z_source_raw
+    )
+
+    sim <- simulate_delta(Z_std = Z$Z_std, alpha = alpha, 
+                          B = B, sigma = sigma)
+    psi_pain[t] <- mean(sim$mu_pain)
+    psi_dep[t]  <- mean(sim$mu_dep)
+  }
+
+  mu_results_rho06$pain_mean[g] <- mean(psi_pain)
+  mu_results_rho06$pain_q025[g] <- as.numeric(quantile(psi_pain, 0.025))
+  mu_results_rho06$pain_q975[g] <- as.numeric(quantile(psi_pain, 0.975))
+  mu_results_rho06$dep_mean[g]  <- mean(psi_dep)
+  mu_results_rho06$dep_q025[g]  <- as.numeric(quantile(psi_dep, 0.025))
+  mu_results_rho06$dep_q975[g]  <- as.numeric(quantile(psi_dep, 0.975))
+}
+
+knitr::kable(
+  mu_results_rho06,
+  digits  = 3,
+  caption = "Sensitivity of transported outcomes to assumed target 
+             baseline means at rho* = 0.6. Compare with 
+             Table X (rho* = 0.0) to assess whether decoupling 
+             of pain and depression estimates persists at nonzero 
+             baseline correlation.")
+```
+
+# 11) Mu sweep at rho* = 0 (Sweep 3 table)
+
+```{r}
+rho_z_target_canonical <- 0.0
+mu_pain_grid <- c(5.8, 6.2, 6.6)
+mu_dep_grid  <- c(8.5, 9.1, 9.7)
+mu_grid      <- expand.grid(mu_pain = mu_pain_grid,
+                             mu_dep  = mu_dep_grid)
+
+mu_results_rho0 <- data.frame(
+  mu_pain   = mu_grid$mu_pain,
+  mu_dep    = mu_grid$mu_dep,
+  pain_mean = NA_real_, pain_q025 = NA_real_, pain_q975 = NA_real_,
+  dep_mean  = NA_real_, dep_q025  = NA_real_, dep_q975  = NA_real_
+)
+
+for (g in 1:nrow(mu_grid)) {
+  mu_z_target_raw_g <- c(pain0 = mu_grid$mu_pain[g],
+                         dep0  = mu_grid$mu_dep[g])
+  psi_pain <- numeric(T)
+  psi_dep  <- numeric(T)
+  for (t in 1:T) {
+    B <- draw_B(beta_sd, enforce_diagonal_signs, cross_signs)
+    sigma <- sigma_prior
+    names(sigma) <- c("pain", "dep")
+    alpha <- c(
+      pain = anchor_alpha(mu_delta_source["pain"], B["pain", ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0)),
+      dep  = anchor_alpha(mu_delta_source["dep"],  B["dep",  ],
+                          z0_std_mean = c(pain0_std = 0, dep0_std = 0))
+    )
+    Z <- simulate_target_Z_std(
+      M               = M,
+      mu_z_target_raw = mu_z_target_raw_g,
+      sd_z_target_raw = sd_z_target_raw,
+      rho_z_target    = rho_z_target_canonical,
+      mu_z_source_raw = mu_z_source_raw,
+      sd_z_source_raw = sd_z_source_raw
+    )
+    sim <- simulate_delta(Z_std = Z$Z_std, alpha = alpha,
+                          B = B, sigma = sigma)
+    psi_pain[t] <- mean(sim$mu_pain)
+    psi_dep[t]  <- mean(sim$mu_dep)
+  }
+  mu_results_rho0$pain_mean[g] <- mean(psi_pain)
+  mu_results_rho0$pain_q025[g] <- as.numeric(quantile(psi_pain, 0.025))
+  mu_results_rho0$pain_q975[g] <- as.numeric(quantile(psi_pain, 0.975))
+  mu_results_rho0$dep_mean[g]  <- mean(psi_dep)
+  mu_results_rho0$dep_q025[g]  <- as.numeric(quantile(psi_dep, 0.025))
+  mu_results_rho0$dep_q975[g]  <- as.numeric(quantile(psi_dep, 0.975))
+}
+
+print(mu_results_rho0)
+```
